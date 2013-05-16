@@ -16,18 +16,17 @@
 
 package com.android.certinstaller;
 
-import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Environment;
 import android.preference.PreferenceActivity;
 import android.security.Credentials;
+import android.security.KeyChain;
 import android.util.Log;
 import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileFilter;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -44,12 +43,9 @@ public class CertFile extends PreferenceActivity implements FileFilter {
 
     private static final String TAG = "CertFile";
 
-    private static final String CERT_EXT = ".crt";
-    private static final String PKCS12_EXT = ".p12";
-
     private static final String CERT_FILE_KEY = "cf";
     private static final int MAX_FILE_SIZE = 1000000;
-    private static final int REQUEST_INSTALL_CODE = 1;
+    protected static final int REQUEST_INSTALL_CODE = 1;
 
     private File mCertFile;
 
@@ -65,14 +61,17 @@ public class CertFile extends PreferenceActivity implements FileFilter {
     protected void onRestoreInstanceState(Bundle savedStates) {
         super.onRestoreInstanceState(savedStates);
         String path = savedStates.getString(CERT_FILE_KEY);
-        if (path != null) mCertFile = new File(path);
+        if (path != null) {
+            mCertFile = new File(path);
+        }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_INSTALL_CODE) {
-            onInstallationDone((resultCode == RESULT_OK)
-                    && Util.deleteFile(mCertFile));
+            boolean success = (resultCode == RESULT_OK
+                               && (mCertFile == null || Util.deleteFile(mCertFile)));
+            onInstallationDone(success);
             mCertFile = null;
         } else {
             Log.w(TAG, "unknown request code: " + requestCode);
@@ -85,6 +84,9 @@ public class CertFile extends PreferenceActivity implements FileFilter {
      * @param success true if installation is done successfully
      */
     protected void onInstallationDone(boolean success) {
+        if (success) {
+            setResult(RESULT_OK);
+        }
     }
 
     /**
@@ -106,11 +108,15 @@ public class CertFile extends PreferenceActivity implements FileFilter {
         File download = new File(root, DOWNLOAD_DIR);
         if (download != null) {
             File[] files = download.listFiles(this);
-            if (files != null) Collections.addAll(allFiles, files);
+            if (files != null) {
+                Collections.addAll(allFiles, files);
+            }
         }
 
         File[] files = root.listFiles(this);
-        if (files != null) Collections.addAll(allFiles, files);
+        if (files != null) {
+            Collections.addAll(allFiles, files);
+        }
 
         return allFiles;
     }
@@ -123,6 +129,19 @@ public class CertFile extends PreferenceActivity implements FileFilter {
     protected void installFromFile(File file) {
         Log.d(TAG, "install cert from " + file);
 
+        String fileName = file.getName();
+        Bundle bundle = getIntent().getExtras();
+
+        final String name;
+        final int installAsUid;
+        if (bundle == null) {
+            name = fileName;
+            installAsUid = -1;
+        } else {
+            name = bundle.getString(KeyChain.EXTRA_NAME, fileName);
+            installAsUid = bundle.getInt(Credentials.EXTRA_INSTALL_AS_UID, -1);
+        }
+
         if (file.exists()) {
             if (file.length() < MAX_FILE_SIZE) {
                 byte[] data = Util.readFile(file);
@@ -132,7 +151,7 @@ public class CertFile extends PreferenceActivity implements FileFilter {
                     return;
                 }
                 mCertFile = file;
-                install(file.getName(), data);
+                install(fileName, name, installAsUid, data);
             } else {
                 Log.w(TAG, "cert file is too large: " + file.length());
                 toastError(CERT_TOO_LARGE_ERROR);
@@ -145,7 +164,7 @@ public class CertFile extends PreferenceActivity implements FileFilter {
         }
     }
 
-    public boolean accept(File file) {
+    @Override public boolean accept(File file) {
         if (!file.isDirectory()) {
             return isFileAcceptable(file.getPath());
         } else {
@@ -154,7 +173,10 @@ public class CertFile extends PreferenceActivity implements FileFilter {
     }
 
     protected boolean isFileAcceptable(String path) {
-        return (path.endsWith(PKCS12_EXT) || path.endsWith(CERT_EXT));
+        return (path.endsWith(Credentials.EXTENSION_CRT) ||
+                path.endsWith(Credentials.EXTENSION_P12) ||
+                path.endsWith(Credentials.EXTENSION_CER) ||
+                path.endsWith(Credentials.EXTENSION_PFX));
     }
 
     protected boolean isSdCardPresent() {
@@ -162,13 +184,18 @@ public class CertFile extends PreferenceActivity implements FileFilter {
                 Environment.MEDIA_MOUNTED);
     }
 
-    private void install(String fileName, byte[] value) {
+    private void install(String fileName, String name, int uid, byte[] value) {
         Intent intent = new Intent(this, CertInstaller.class);
-        intent.putExtra(CredentialHelper.CERT_NAME_KEY, fileName);
-        if (fileName.endsWith(PKCS12_EXT)) {
-            intent.putExtra(Credentials.PKCS12, value);
+        intent.putExtra(KeyChain.EXTRA_NAME, name);
+        intent.putExtra(Credentials.EXTRA_INSTALL_AS_UID, uid);
+        if (fileName.endsWith(Credentials.EXTENSION_PFX)
+                || fileName.endsWith(Credentials.EXTENSION_P12)) {
+            intent.putExtra(KeyChain.EXTRA_PKCS12, value);
+        } else if (fileName.endsWith(Credentials.EXTENSION_CER)
+                   || fileName.endsWith(Credentials.EXTENSION_CRT)) {
+            intent.putExtra(KeyChain.EXTRA_CERTIFICATE, value);
         } else {
-            intent.putExtra(Credentials.CERTIFICATE, value);
+            throw new AssertionError(fileName);
         }
         startActivityForResult(intent, REQUEST_INSTALL_CODE);
     }

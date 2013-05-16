@@ -21,6 +21,7 @@ import android.os.Environment;
 import android.os.FileObserver;
 import android.preference.Preference;
 import android.preference.PreferenceScreen;
+import android.security.Credentials;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -37,8 +38,6 @@ public class CertFileList extends CertFile
     private static final String TAG = "CertFileList";
 
     private static final String DOWNLOAD_DIR = "download";
-    private static final int MAX_FILE_SIZE = 1000000;
-    private static final int REQUEST_INSTALL_CODE = 1;
 
     private SdCardMonitor mSdCardMonitor;
 
@@ -59,6 +58,7 @@ public class CertFileList extends CertFile
 
     @Override
     protected void onInstallationDone(boolean fileDeleted) {
+        super.onInstallationDone(fileDeleted);
         if (!fileDeleted) {
             if (isSdCardPresent()) {
                 setAllFilesEnabled(true);
@@ -72,7 +72,9 @@ public class CertFileList extends CertFile
 
     @Override
     protected void onError(int errorId) {
-        if (errorId == CERT_FILE_MISSING_ERROR) createFileList();
+        if (errorId == CERT_FILE_MISSING_ERROR) {
+            createFileList();
+        }
     }
 
     private void setAllFilesEnabled(boolean enabled) {
@@ -98,7 +100,8 @@ public class CertFileList extends CertFile
         if (isFinishing()) {
             Log.d(TAG, "finishing, exit createFileList()");
             return;
-        } else if (!isSdCardPresent()) {
+        } 
+        if (!isSdCardPresent()) {
             Toast.makeText(this, R.string.sdcard_not_present,
                     Toast.LENGTH_SHORT).show();
             finish();
@@ -113,6 +116,8 @@ public class CertFileList extends CertFile
             if (allFiles.isEmpty()) {
                 Toast.makeText(this, R.string.no_cert_file_found,
                         Toast.LENGTH_SHORT).show();
+                finish();
+                return;
             } else {
                 int prefixEnd = Environment.getExternalStorageDirectory()
                         .getCanonicalPath().length() + 1;
@@ -131,12 +136,16 @@ public class CertFileList extends CertFile
     }
 
     private void startSdCardMonitor() {
-        if (mSdCardMonitor == null) mSdCardMonitor = new SdCardMonitor();
+        if (mSdCardMonitor == null) {
+            mSdCardMonitor = new SdCardMonitor();
+        }
         mSdCardMonitor.startWatching();
     }
 
     private void stopSdCardMonitor() {
-        if (mSdCardMonitor != null) mSdCardMonitor.stopWatching();
+        if (mSdCardMonitor != null) {
+            mSdCardMonitor.stopWatching();
+        }
     }
 
     private class SdCardMonitor {

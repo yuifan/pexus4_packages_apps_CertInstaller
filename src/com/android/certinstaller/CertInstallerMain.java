@@ -17,12 +17,20 @@
 package com.android.certinstaller;
 
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.security.Credentials;
+import android.security.KeyChain;
+import android.util.Log;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
+
+import libcore.io.IoUtils;
 
 /**
  * The main class for installing certificates to the system keystore. It reacts
@@ -32,9 +40,12 @@ public class CertInstallerMain extends CertFile implements Runnable {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        if (savedInstanceState != null) return;
+        if (savedInstanceState != null) {
+            return;
+        }
 
         new Thread(new Runnable() {
+            @Override
             public void run() {
                 // don't want to call startActivityForResult() (invoked in
                 // installFromFile()) here as it makes the new activity (thus
@@ -44,14 +55,33 @@ public class CertInstallerMain extends CertFile implements Runnable {
         }).start();
     }
 
+    @Override
     public void run() {
         Intent intent = getIntent();
         String action = (intent == null) ? null : intent.getAction();
 
-        if (Credentials.INSTALL_ACTION.equals(action)) {
+        if (Credentials.INSTALL_ACTION.equals(action)
+                || Credentials.INSTALL_AS_USER_ACTION.equals(action)) {
             Bundle bundle = intent.getExtras();
 
-            if ((bundle == null) || bundle.isEmpty()) {
+            /*
+             * There is a special INSTALL_AS_USER action that this activity is
+             * aliased to, but you have to have a permission to call it. If the
+             * caller got here any other way, remove the extra that we allow in
+             * that INSTALL_AS_USER path.
+             */
+            if (bundle != null && !Credentials.INSTALL_AS_USER_ACTION.equals(action)) {
+                bundle.remove(Credentials.EXTRA_INSTALL_AS_UID);
+            }
+
+            // If bundle is empty of any actual credentials, install from external storage.
+            // Otherwise, pass extras to CertInstaller to install those credentials.
+            // Either way, we use KeyChain.EXTRA_NAME as the default name if available.
+            if (bundle == null
+                    || bundle.isEmpty()
+                    || (bundle.size() == 1
+                        && (bundle.containsKey(KeyChain.EXTRA_NAME)
+                            || bundle.containsKey(Credentials.EXTRA_INSTALL_AS_UID)))) {
                 if (!isSdCardPresent()) {
                     Toast.makeText(this, R.string.sdcard_not_present,
                             Toast.LENGTH_SHORT).show();
@@ -64,20 +94,65 @@ public class CertInstallerMain extends CertFile implements Runnable {
                         installFromFile(allFiles.get(0));
                         return;
                     } else {
-                        startActivity(new Intent(this, CertFileList.class));
+                        Intent newIntent = new Intent(this, CertFileList.class);
+                        newIntent.putExtras(intent);
+                        startActivityForResult(newIntent, REQUEST_INSTALL_CODE);
+                        return;
                     }
                 }
             } else {
                 Intent newIntent = new Intent(this, CertInstaller.class);
                 newIntent.putExtras(intent);
-                startActivity(newIntent);
+                startActivityForResult(newIntent, REQUEST_INSTALL_CODE);
+                return;
+            }
+        } else if (Intent.ACTION_VIEW.equals(action)) {
+            Uri data = intent.getData();
+            String type = intent.getType();
+            if ((data != null) && (type != null)) {
+                byte[] payload = null;
+                InputStream is = null;
+                try {
+                    is = getContentResolver().openInputStream(data);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream();
+                    byte[] buffer = new byte[1024];
+                    int read = 0;
+                    while ((read = is.read(buffer)) > 0) {
+                        out.write(buffer, 0, read);
+                    }
+                    out.flush();
+                    payload = out.toByteArray();
+                } catch (IOException ignored) {
+                    // Not much we can do - it will be logged below as an error.
+                } finally {
+                    IoUtils.closeQuietly(is);
+                }
+                if (payload == null) {
+                    Log.e("CertInstaller", "Unable to read stream for for certificate");
+                } else {
+                    installByType(type, payload);
+                }
             }
         }
         finish();
     }
 
+    private void installByType(String type, byte[] value) {
+        Intent intent = new Intent(this, CertInstaller.class);
+        if ("application/x-pkcs12".equals(type)) {
+            intent.putExtra(KeyChain.EXTRA_PKCS12, value);
+        } else if ("application/x-x509-ca-cert".equals(type)
+                || "application/x-x509-user-cert".equals(type)) {
+            intent.putExtra(KeyChain.EXTRA_CERTIFICATE, value);
+        } else {
+            throw new AssertionError("Unknown type: " + type);
+        }
+        startActivityForResult(intent, REQUEST_INSTALL_CODE);
+    }
+
     @Override
     protected void onInstallationDone(boolean success) {
+        super.onInstallationDone(success);
         finish();
     }
 

@@ -23,12 +23,17 @@ import android.app.ProgressDialog;
 import android.content.ActivityNotFoundException;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.os.AsyncTask;
 import android.os.Bundle;
 import android.security.Credentials;
+import android.security.KeyChain;
+import android.security.KeyChain.KeyChainConnection;
 import android.security.KeyStore;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
+import android.widget.EditText;
 import android.widget.Toast;
 
 import java.io.Serializable;
@@ -39,8 +44,7 @@ import java.util.Map;
 /**
  * Installs certificates to the system keystore.
  */
-public class CertInstaller extends Activity
-        implements DialogInterface.OnClickListener {
+public class CertInstaller extends Activity {
     private static final String TAG = "CertInstaller";
 
     private static final int STATE_INIT = 1;
@@ -57,21 +61,30 @@ public class CertInstaller extends Activity
     private static final String NEXT_ACTION_KEY = "na";
 
     // key to KeyStore
-    private static final byte[] PKEY_MAP_KEY = "PKEY_MAP".getBytes();
+    private static final String PKEY_MAP_KEY = "PKEY_MAP";
 
-    private KeyStore mKeyStore = KeyStore.getInstance();
-    private ViewHelper mView = new ViewHelper();
-    private int mButtonClicked;
+    private final KeyStore mKeyStore = KeyStore.getInstance();
+    private final ViewHelper mView = new ViewHelper();
 
     private int mState;
     private CredentialHelper mCredentials;
     private MyAction mNextAction;
 
+    private CredentialHelper createCredentialHelper(Intent intent) {
+        try {
+            return new CredentialHelper(intent);
+        } catch (Throwable t) {
+            Log.w(TAG, "createCredentialHelper", t);
+            toastErrorAndFinish(R.string.invalid_cert);
+            return new CredentialHelper();
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedStates) {
         super.onCreate(savedStates);
 
-        mCredentials = new CredentialHelper(getIntent());
+        mCredentials = createCredentialHelper(getIntent());
 
         mState = (savedStates == null) ? STATE_INIT : STATE_RUNNING;
 
@@ -104,13 +117,15 @@ public class CertInstaller extends Activity
         if (mState == STATE_INIT) {
             mState = STATE_RUNNING;
         } else {
-            if (mNextAction != null) mNextAction.run(this);
+            if (mNextAction != null) {
+                mNextAction.run(this);
+            }
         }
     }
 
     private boolean needsKeyStoreAccess() {
         return ((mCredentials.hasKeyPair() || mCredentials.hasUserCertificate())
-                && (mKeyStore.test() != KeyStore.NO_ERROR));
+                && !mKeyStore.isUnlocked());
     }
 
     @Override
@@ -150,19 +165,18 @@ public class CertInstaller extends Activity
     }
 
     @Override
-    protected void onPrepareDialog (int dialogId, Dialog dialog) {
-        super.onPrepareDialog(dialogId, dialog);
-        mButtonClicked = DialogInterface.BUTTON_NEGATIVE;
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode,
-            Intent data) {
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_SYSTEM_INSTALL_CODE) {
             if (resultCode == RESULT_OK) {
                 Log.d(TAG, "credential is added: " + mCredentials.getName());
                 Toast.makeText(this, getString(R.string.cert_is_added,
                         mCredentials.getName()), Toast.LENGTH_LONG).show();
+
+                if (mCredentials.hasCaCerts()) {
+                    // more work to do, don't finish just yet
+                    new InstallCaCertsToKeyChainTask().execute();
+                    return;
+                }
                 setResult(RESULT_OK);
             } else {
                 Log.d(TAG, "credential not saved, err: " + resultCode);
@@ -172,6 +186,30 @@ public class CertInstaller extends Activity
             Log.w(TAG, "unknown request code: " + requestCode);
         }
         finish();
+    }
+
+    private class InstallCaCertsToKeyChainTask extends AsyncTask<Void, Void, Boolean> {
+
+        @Override protected Boolean doInBackground(Void... unused) {
+            try {
+                KeyChainConnection keyChainConnection = KeyChain.bind(CertInstaller.this);
+                try {
+                    return mCredentials.installCaCertsToKeyChain(keyChainConnection.getService());
+                } finally {
+                    keyChainConnection.close();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        @Override protected void onPostExecute(Boolean success) {
+            if (success) {
+                setResult(RESULT_OK);
+            }
+            finish();
+        }
     }
 
     void installOthers() {
@@ -212,8 +250,8 @@ public class CertInstaller extends Activity
     }
 
     private void saveKeyPair() {
-        byte[] privatekey = mCredentials.getData(Credentials.PRIVATE_KEY);
-        String key = Util.toMd5(mCredentials.getData(Credentials.PUBLIC_KEY));
+        byte[] privatekey = mCredentials.getData(Credentials.EXTRA_PRIVATE_KEY);
+        String key = Util.toMd5(mCredentials.getData(Credentials.EXTRA_PUBLIC_KEY));
         Map<String, byte[]> map = getPkeyMap();
         map.put(key, privatekey);
         savePkeyMap(map);
@@ -221,7 +259,13 @@ public class CertInstaller extends Activity
     }
 
     private void savePkeyMap(Map<String, byte[]> map) {
-        byte[] bytes = Util.toBytes((Serializable) map);
+        if (map.isEmpty()) {
+            if (!mKeyStore.delete(PKEY_MAP_KEY)) {
+                Log.w(TAG, "savePkeyMap(): failed to delete pkey map");
+            }
+            return;
+        }
+        byte[] bytes = Util.toBytes(map);
         if (!mKeyStore.put(PKEY_MAP_KEY, bytes)) {
             Log.w(TAG, "savePkeyMap(): failed to write pkey map");
         }
@@ -241,23 +285,20 @@ public class CertInstaller extends Activity
         // show progress bar and extract certs in a background thread
         showDialog(PROGRESS_BAR_DIALOG);
 
-        new Thread(new Runnable() {
-            public void run() {
-                final boolean success = mCredentials.extractPkcs12(password);
-
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        MyAction action = new OnExtractionDoneAction(success);
-                        if (mState == STATE_PAUSED) {
-                            // activity is paused; run it in next onResume()
-                            mNextAction = action;
-                        } else {
-                            action.run(CertInstaller.this);
-                        }
-                    }
-                });
+        new AsyncTask<Void,Void,Boolean>() {
+            @Override protected Boolean doInBackground(Void... unused) {
+                return mCredentials.extractPkcs12(password);
             }
-        }).start();
+            @Override protected void onPostExecute(Boolean success) {
+                MyAction action = new OnExtractionDoneAction(success);
+                if (mState == STATE_PAUSED) {
+                    // activity is paused; run it in next onResume()
+                    mNextAction = action;
+                } else {
+                    action.run(CertInstaller.this);
+                }
+            }
+        }.execute();
     }
 
     void onExtractionDone(boolean success) {
@@ -273,33 +314,13 @@ public class CertInstaller extends Activity
         }
     }
 
-    public void onClick(DialogInterface dialog, int which) {
-        mButtonClicked = which;
-    }
-
     private Dialog createPkcs12PasswordDialog() {
         View view = View.inflate(this, R.layout.password_dialog, null);
         mView.setView(view);
-
-        DialogInterface.OnDismissListener onDismissHandler =
-                new DialogInterface.OnDismissListener() {
-            public void onDismiss(DialogInterface dialog) {
-                if (mButtonClicked == DialogInterface.BUTTON_NEGATIVE) {
-                    toastErrorAndFinish(R.string.cert_not_saved);
-                    return;
-                }
-
-                final String password = mView.getText(R.id.credential_password);
-
-                if (TextUtils.isEmpty(password)) {
-                    mView.showError(R.string.password_empty_error);
-                    showDialog(PKCS12_PASSWORD_DIALOG);
-                } else {
-                    mNextAction = new Pkcs12ExtractAction(password);
-                    mNextAction.run(CertInstaller.this);
-                }
-            }
-        };
+        if (mView.getHasEmptyError()) {
+            mView.showError(R.string.password_empty_error);
+            mView.setHasEmptyError(false);
+        }
 
         String title = mCredentials.getName();
         title = TextUtils.isEmpty(title)
@@ -308,57 +329,75 @@ public class CertInstaller extends Activity
         Dialog d = new AlertDialog.Builder(this)
                 .setView(view)
                 .setTitle(title)
-                .setPositiveButton(android.R.string.ok, this)
-                .setNegativeButton(android.R.string.cancel, this)
+                .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int id) {
+                        String password = mView.getText(R.id.credential_password);
+                        mNextAction = new Pkcs12ExtractAction(password);
+                        mNextAction.run(CertInstaller.this);
+                     }
+                })
+                .setNegativeButton(android.R.string.cancel, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int id) {
+                        toastErrorAndFinish(R.string.cert_not_saved);
+                    }
+                })
                 .create();
-        d.setOnDismissListener(onDismissHandler);
+        d.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface dialog) {
+                toastErrorAndFinish(R.string.cert_not_saved);
+            }
+        });
         return d;
     }
 
     private Dialog createNameCredentialDialog() {
-        View view = View.inflate(this, R.layout.name_credential_dialog, null);
+        ViewGroup view = (ViewGroup) View.inflate(this, R.layout.name_credential_dialog, null);
         mView.setView(view);
-
-        mView.setText(R.id.credential_info,
-                mCredentials.getDescription(this).toString());
-
-        DialogInterface.OnDismissListener onDismissHandler =
-                new DialogInterface.OnDismissListener() {
-            public void onDismiss(DialogInterface dialog) {
-                if (mButtonClicked == DialogInterface.BUTTON_NEGATIVE) {
-                    toastErrorAndFinish(R.string.cert_not_saved);
-                    return;
-                }
-
-                String name = mView.getText(R.id.credential_name);
-                if (TextUtils.isEmpty(name)) {
-                    mView.showError(R.string.name_empty_error);
-                    showDialog(NAME_CREDENTIAL_DIALOG);
-                } else {
-                    removeDialog(NAME_CREDENTIAL_DIALOG);
-                    mCredentials.setName(name);
-
-                    // install everything to system keystore
-                    try {
-                        startActivityForResult(
-                                mCredentials.createSystemInstallIntent(),
-                                REQUEST_SYSTEM_INSTALL_CODE);
-                    } catch (ActivityNotFoundException e) {
-                        Log.w(TAG, "systemInstall(): " + e);
-                        toastErrorAndFinish(R.string.cert_not_saved);
-                    }
-                }
-            }
-        };
-
-        mView.setText(R.id.credential_name, getDefaultName());
+        if (mView.getHasEmptyError()) {
+            mView.showError(R.string.name_empty_error);
+            mView.setHasEmptyError(false);
+        }
+        mView.setText(R.id.credential_info, mCredentials.getDescription(this).toString());
+        final EditText nameInput = (EditText) view.findViewById(R.id.credential_name);
+        nameInput.setText(getDefaultName());
+        nameInput.selectAll();
         Dialog d = new AlertDialog.Builder(this)
                 .setView(view)
                 .setTitle(R.string.name_credential_dialog_title)
-                .setPositiveButton(android.R.string.ok, this)
-                .setNegativeButton(android.R.string.cancel, this)
+                .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int id) {
+                        String name = mView.getText(R.id.credential_name);
+                        if (TextUtils.isEmpty(name)) {
+                            mView.setHasEmptyError(true);
+                            removeDialog(NAME_CREDENTIAL_DIALOG);
+                            showDialog(NAME_CREDENTIAL_DIALOG);
+                        } else {
+                            removeDialog(NAME_CREDENTIAL_DIALOG);
+                            mCredentials.setName(name);
+
+                            // install everything to system keystore
+                            try {
+                                startActivityForResult(
+                                        mCredentials.createSystemInstallIntent(),
+                                        REQUEST_SYSTEM_INSTALL_CODE);
+                            } catch (ActivityNotFoundException e) {
+                                Log.w(TAG, "systemInstall(): " + e);
+                                toastErrorAndFinish(R.string.cert_not_saved);
+                            }
+                        }
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int id) {
+                        toastErrorAndFinish(R.string.cert_not_saved);
+                    }
+                })
                 .create();
-        d.setOnDismissListener(onDismissHandler);
+        d.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface dialog) {
+                toastErrorAndFinish(R.string.cert_not_saved);
+            }
+        });
         return d;
     }
 
@@ -383,6 +422,7 @@ public class CertInstaller extends Activity
             implements Serializable {
         private static final long serialVersionUID = 1L;
 
+        @Override
         protected boolean removeEldestEntry(Map.Entry eldest) {
             // Note: one key takes about 1300 bytes in the keystore, so be
             // cautious about allowing more outstanding keys in the map that
@@ -396,7 +436,7 @@ public class CertInstaller extends Activity
     }
 
     private static class Pkcs12ExtractAction implements MyAction {
-        private String mPassword;
+        private final String mPassword;
         private transient boolean hasRun;
 
         Pkcs12ExtractAction(String password) {
@@ -404,7 +444,9 @@ public class CertInstaller extends Activity
         }
 
         public void run(CertInstaller host) {
-            if (hasRun) return;
+            if (hasRun) {
+                return;
+            }
             hasRun = true;
             host.extractPkcs12InBackground(mPassword);
         }
@@ -418,7 +460,7 @@ public class CertInstaller extends Activity
     }
 
     private static class OnExtractionDoneAction implements MyAction {
-        private boolean mSuccess;
+        private final boolean mSuccess;
 
         OnExtractionDoneAction(boolean success) {
             mSuccess = success;
